@@ -135,6 +135,24 @@ The raw and summary CSVs include `PromptMode`, `BenchmarkScope`,
 generation columns for best-case throughput. Keep Q8/GGUF rows separate from HF
 FP16/BF16/F32 rows when publishing results.
 
+### ROCm / HIP Benchmarks
+
+Single-run CLI measurements on Linux with an AMD Instinct MI50 (200 W TDP),
+ROCm 7.2.4, and the `QWEN3_TTS_HIP` backend. These are cold-process runs
+(`-j 18` CPU threads) with no reference audio or speaker embedding — the
+lightest unconditioned prompt. The primary metric is the CLI's reported
+`Throughput` value (audio duration divided by total synthesis time; higher is
+better).
+
+| Model     | Precision   | Total   | Audio Duration  | Throughput |
+|-------    |-----------  |-------  |---------------- |------------|
+| 0.6B Base | Q8_0 (HIP)  | 1312 ms | 4.48 s          | 3.41x      |
+| 0.6B Base | Q8_0 (HIP)  | 1185 ms | 3.12 s          | 2.63x      | DGGML_HIP_GRAPHS=OFF 
+| 0.6B Base | FP16 (HIP)  | 1982 ms | 3.76 s          | 1.90x      |
+| 1.7B Base | Q8_0 (HIP)  | 1223 ms | 3.76 s          | 3.07x      |
+| 1.7B Base | Q4_K_M (HIP)| 2008 ms | 2.96 s          | 1.47x      | (slowdown probably specific to gfx906)
+
+
 ## Quick Start
 
 ### Windows
@@ -196,6 +214,17 @@ cmake -S . -B build-cuda \
   -DQWEN3_TTS_CUDA=ON \
   -DGGML_CUDA=ON
 cmake --build build-cuda -j
+```
+
+For ROCm/HIP builds (AMD GPUs), enable the GGML HIP backend and DGGML_HIP_GRAPHS as well for quite substantial 30% speed boost backend:
+
+```bash
+cmake -S . -B build-hip \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DQWEN3_TTS_HIP=ON \
+  -DGGML_HIP_GRAPHS=ON \
+  -DGGML_HIP=ON
+cmake --build build-hip -j
 ```
 
 Model setup is the same as on Windows:
@@ -463,6 +492,7 @@ Common CMake options:
 | Option | Purpose |
 |--------|---------|
 | `QWEN3_TTS_CUDA` | Enable GGML CUDA integration |
+| `QWEN3_TTS_HIP` | Enable GGML HIP/ROCm integration (AMD GPUs) |
 | `QWEN3_TTS_TIMING` | Enable detailed timing logs |
 | `QWEN3_TTS_BUILD_SHARED` | Build optional JNI shared library |
 | `QWEN3_TTS_EMBED_GGML` | Build GGML as a CMake subdirectory |
