@@ -234,6 +234,23 @@ target_link_libraries(qwen3-tts-cli PRIVATE
     qwen3_tts
 )
 
+# HTTP server executable
+add_executable(qwen3-tts-server
+    src/server/server_main.cpp
+    src/server/wav_memory.cpp
+)
+target_include_directories(qwen3-tts-server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+)
+target_link_libraries(qwen3-tts-server PRIVATE
+    qwen3_tts
+    Threads::Threads
+)
+if(WIN32)
+    target_link_libraries(qwen3-tts-server PRIVATE ws2_32)
+endif()
+
 # Test executable for tokenizer
 add_executable(test_tokenizer
     tests/test_tokenizer.cpp
@@ -288,7 +305,7 @@ target_link_libraries(test_decoder PRIVATE
 )
 
 # Install targets
-install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder speech_tokenizer_encoder audio_tokenizer_decoder qwen3_tts qwen3-tts-cli
+install(TARGETS text_tokenizer tts_transformer audio_tokenizer_encoder speech_tokenizer_encoder audio_tokenizer_decoder qwen3_tts qwen3-tts-cli qwen3-tts-server
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
 )
