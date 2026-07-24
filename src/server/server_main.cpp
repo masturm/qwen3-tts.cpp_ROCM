@@ -358,6 +358,154 @@ void handle_speakers(qwen3_tts::Qwen3TTS & tts, httplib::Response & res) {
     send_json(res, 200, json{{"speakers", tts.get_available_speakers()}});
 }
 
+// ---------------------------------------------------------------------------
+// OpenAI-compatible helpers
+// ---------------------------------------------------------------------------
+
+// Map OpenAI voice names → language codes the upstream understands.
+static std::string openai_voice_to_language(const std::string & voice) {
+    std::string lower = voice;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    // OpenAI voice names → "en"
+    if (lower == "alloy" || lower == "echo" || lower == "fable" ||
+        lower == "onyx"  || lower == "nova"  || lower == "shimmer") {
+        return "en";
+    }
+
+    // If it's already a known language code, pass through
+    static const std::string known[] = {
+        "en", "ru", "zh", "ja", "ko", "de", "fr", "es", "it", "pt"
+    };
+    for (const auto & k : known) {
+        if (lower == k) return k;
+    }
+
+    return "en";  // default
+}
+
+// Resolve language string → integer ID (same as language_to_id but returns string for JSON)
+static int resolve_language_id(const std::string & lang, bool & ok) {
+    return language_to_id(lang, ok);
+}
+
+// Send audio with OpenAI-compatible response handling.
+// OpenAI clients expect audio directly; we return WAV (native format).
+// Unsupported formats fall back to WAV with a warning header.
+void send_openai_audio(httplib::Response & res, const std::vector<float> & audio,
+                       int sample_rate, const qwen3_tts::tts_result & r,
+                       const std::string & requested_format) {
+    std::vector<uint8_t> wav;
+    if (!qwen3_tts::wav_encode(audio, sample_rate, wav)) {
+        send_error(res, 500, "wav_encode failed");
+        return;
+    }
+
+    std::string content_type = "audio/wav";
+
+    // OpenAI format mapping – we only natively support WAV.
+    // Log warning for formats we can't convert (mp3/flac/opus/pcm need ffmpeg).
+    if (requested_format == "mp3" || requested_format == "flac" ||
+        requested_format == "opus" || requested_format == "pcm") {
+        fprintf(stderr, "Warning: response_format=%s not natively supported, returning WAV\n",
+                requested_format.c_str());
+        res.set_header("X-Format-Fallback", "wav");
+    } else if (requested_format == "mpeg") {
+        content_type = "audio/mpeg";
+        res.set_header("X-Format-Fallback", "wav");
+    }
+
+    char dur[32];
+    std::snprintf(dur, sizeof(dur), "%.3f", sample_rate > 0 ? (double) audio.size() / sample_rate : 0.0);
+    res.set_header("X-Audio-Duration-Seconds", dur);
+    res.set_header("X-Synth-Total-Ms",    std::to_string(r.t_total_ms));
+    res.set_header("X-Synth-Tokenize-Ms", std::to_string(r.t_tokenize_ms));
+    res.set_header("X-Synth-Encode-Ms",   std::to_string(r.t_encode_ms));
+    res.set_header("X-Synth-Generate-Ms", std::to_string(r.t_generate_ms));
+    res.set_header("X-Synth-Decode-Ms",   std::to_string(r.t_decode_ms));
+
+    res.status = 200;
+    res.set_header("Content-Type", content_type);
+    res.set_content(std::string(wav.begin(), wav.end()), content_type);
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI-compatible handlers
+// ---------------------------------------------------------------------------
+
+void handle_openai_models(httplib::Response & res) {
+    // Return a model list compatible with OpenAI's /v1/models
+    json model = json::object({
+        {"id", "qwen3-tts-1.7b"},
+        {"object", "model"},
+        {"created", 1700000000},
+        {"owned_by", "local"}
+    });
+    json out = json::object({
+        {"object", "list"},
+        {"data", json::array({model})}
+    });
+    send_json(res, 200, out);
+}
+
+void handle_openai_speech(synth_context & ctx, const httplib::Request & req, httplib::Response & res) {
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const std::exception & e) {
+        send_error(res, 400, std::string("invalid JSON: ") + e.what());
+        return;
+    }
+
+    // OpenAI uses "input" for text
+    if (!body.contains("input") || !body["input"].is_string()) {
+        send_error(res, 400, "missing 'input' (string)");
+        return;
+    }
+    std::string text = body["input"].get<std::string>();
+
+    // Voice → language mapping
+    std::string voice = body.value("voice", "alloy");
+    std::string lang_str = openai_voice_to_language(voice);
+    bool ok;
+    int lang_id = resolve_language_id(lang_str, ok);
+    if (!ok) {
+        send_error(res, 400, std::string("unknown voice/language: ") + voice);
+        return;
+    }
+
+    // Speed warning (logged, not supported)
+    float speed = body.value("speed", 1.0f);
+    if (speed != 1.0f) {
+        fprintf(stderr, "Warning: speed=%.2f not directly supported by upstream, ignoring\n", speed);
+    }
+
+    // Response format
+    std::string response_format = body.value("response_format", "mp3");
+
+    // Build params
+    qwen3_tts::tts_params params;
+    std::string err;
+    json params_json = json::object({{"language", lang_id}});
+    if (!apply_params_from_json(params_json, params, ctx.default_threads, err)) {
+        send_error(res, 400, err);
+        return;
+    }
+
+    // Synthesize (lock shared TTS instance)
+    qwen3_tts::tts_result r;
+    {
+        std::lock_guard<std::mutex> lock(ctx.mu);
+        r = ctx.tts.synthesize(text, params);
+    }
+    if (!r.success) {
+        send_error(res, 500, r.error_msg);
+        return;
+    }
+
+    send_openai_audio(res, r.audio, r.sample_rate, r, response_format);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -412,6 +560,14 @@ int main(int argc, char ** argv) {
     });
     svr.Post("/v1/speaker_embedding", [&](const httplib::Request & req, httplib::Response & res) {
         handle_speaker_embedding(ctx, req, res);
+    });
+
+    // OpenAI-compatible endpoints
+    svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
+        handle_openai_models(res);
+    });
+    svr.Post("/v1/audio/speech", [&](const httplib::Request & req, httplib::Response & res) {
+        handle_openai_speech(ctx, req, res);
     });
 
     svr.set_exception_handler([](const httplib::Request &, httplib::Response & res, std::exception_ptr ep) {

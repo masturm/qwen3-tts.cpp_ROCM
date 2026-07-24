@@ -198,6 +198,93 @@ jq -n --slurpfile s speaker.json \
     --output second.wav
 ```
 
+### OpenAI-Compatible Endpoints
+
+The server also exposes OpenAI-compatible endpoints for use with OpenAI SDK clients or any tooling that expects the OpenAI TTS API shape.
+
+#### `GET /v1/models`
+
+List available TTS models. Returns a list compatible with OpenAI's `/v1/models`.
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "qwen3-tts-1.7b",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "local"
+    }
+  ]
+}
+```
+
+```bash
+curl -s http://127.0.0.1:8080/v1/models
+```
+
+#### `POST /v1/audio/speech`
+
+OpenAI-compatible text-to-speech endpoint. Returns `audio/wav`.
+
+Request body (JSON):
+
+```json
+{
+  "model": "qwen3-tts-1.7b",
+  "input": "Hello from the OpenAI API!",
+  "voice": "alloy",
+  "speed": 1.0,
+  "response_format": "wav"
+}
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `model` | ignored | Accepted for compatibility; routes to the loaded model |
+| `input` | required | Text to synthesize (string) |
+| `voice` | `"alloy"` | Voice name or language code. OpenAI voice names (`alloy`, `echo`, `fable`, `onyx`, `nova`, `shimmer`) map to `"en"`. Language codes (`en`, `ru`, `zh`, `ja`, `ko`, `de`, `fr`, `es`, `it`, `pt`) are passed through directly |
+| `speed` | `1.0` | Logged as warning if not `1.0`; not directly supported |
+| `response_format` | `"mp3"` | Only `wav` is natively supported. Other formats (`mp3`, `flac`, `opus`, `pcm`, `mpeg`) return WAV with an `X-Format-Fallback: wav` header |
+
+Example:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Hello from the OpenAI API!","voice":"alloy"}' \
+  --output hello_openai.wav
+```
+
+Using the OpenAI Python SDK:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8080/v1",
+    api_key="not-needed"
+)
+
+with client.audio.speech.with_streaming_response.create(
+    model="qwen3-tts-1.7b",
+    voice="alloy",
+    input="Hello from the OpenAI API!",
+    response_format="wav",
+) as response:
+    response.stream_to_file("hello_openai.wav")
+```
+
+Using a language code directly as the voice:
+
+```bash
+curl -s http://127.0.0.1:8080/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"Hallo auf Deutsch!","voice":"de"}' \
+  --output german.wav
+```
+
 ## Error responses
 
 Non-2xx responses return JSON:
