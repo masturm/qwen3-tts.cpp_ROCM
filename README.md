@@ -1,3 +1,7 @@
+----------------------------------------------------------------------------------------
+This is a branch which add building for ROCM and adds a OPENAI compatible server
+Speed of about 5 RTF can be reached on 1.7B 8q with MI50 see more details in bench section below
+----------------------------------------------------------------------------------------
 # qwen3-tts.cpp
 
 Native C++17 / GGML inference for Qwen3-TTS.
