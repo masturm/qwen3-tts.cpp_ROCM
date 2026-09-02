@@ -21,7 +21,10 @@ void reset_scheduler_reserve_state(tts_transformer_state & state) {
     state.code_pred_sched_reserve_failed = false;
     state.talker_replay_ready = false;
     state.talker_replay_failed = false;
+    state.talker_replay_disabled_logged = false;
     state.talker_replay_n_kv_pad = 0;
+    state.talker_replay_last_bucket = 0;
+    state.talker_replay_last_buffer_bytes = 0;
     state.talker_replay_graph = nullptr;
     if (state.talker_replay_sched) {
         ggml_backend_sched_reset(state.talker_replay_sched);

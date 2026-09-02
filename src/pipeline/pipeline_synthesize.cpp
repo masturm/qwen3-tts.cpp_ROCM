@@ -1664,11 +1664,77 @@ tts_result pipeline_internal::ops::synthesize_internal(Qwen3TTS & self,
         }
     }
 
-    if (!self.audio_decoder_.decode(decoder_code_data, decoder_frames, result.audio)) {
-        result.error_msg = "Failed to decode speech codes: " + self.audio_decoder_.get_error();
+    // Bounded-chunk decode. Decoding the whole clip in a single graph
+    // reserves a compute buffer proportional to the clip length (~16.5 GiB
+    // for 4000 frames on the 12 Hz vocoder), which OOMs on shared GPUs and
+    // used to abort the process inside ggml. Decode in chunks with left
+    // context instead: the context samples are dropped after each chunk, so
+    // the output is a sample-exact concatenation of the chunk outputs.
+    // Set QWEN3_TTS_DECODE_CHUNK_FRAMES=0 to restore single-shot decoding.
+    const char * chunk_env = std::getenv("QWEN3_TTS_DECODE_CHUNK_FRAMES");
+    int32_t decode_chunk_frames = 256;
+    if (chunk_env && chunk_env[0]) {
+        decode_chunk_frames = std::atoi(chunk_env);
+    }
+    // Left context must cover the decoder's causal attention window so that
+    // every emitted sample is computed with the same context as a single
+    // batch decode would provide.
+    const int32_t decode_left_ctx = std::max(decoder_cfg.sliding_window, 32);
+
+    audio_decoder_timing decoder_timing = {};
+    auto add_decoder_timing = [&decoder_timing](const audio_decoder_timing & t) {
+        decoder_timing.graph_build_ms += t.graph_build_ms;
+        decoder_timing.graph_alloc_ms += t.graph_alloc_ms;
+        decoder_timing.input_upload_ms += t.input_upload_ms;
+        decoder_timing.graph_compute_ms += t.graph_compute_ms;
+        decoder_timing.output_read_ms += t.output_read_ms;
+        decoder_timing.total_ms += t.total_ms;
+        decoder_timing.graph_rebuilt += t.graph_rebuilt;
+        decoder_timing.n_frames += t.n_frames;
+        decoder_timing.n_samples += t.n_samples;
+    };
+
+    bool decode_ok = true;
+    if (decode_chunk_frames <= 0 || decoder_frames <= decode_chunk_frames) {
+        if (!self.audio_decoder_.decode(decoder_code_data, decoder_frames, result.audio)) {
+            decode_ok = false;
+        }
+        add_decoder_timing(self.audio_decoder_.get_last_timing());
+    } else {
+        result.audio.clear();
+        for (int32_t start = 0; start < decoder_frames && decode_ok; start += decode_chunk_frames) {
+            const int32_t end = std::min(decoder_frames, start + decode_chunk_frames);
+            const int32_t slice_start = (start > 0)
+                ? std::max(0, start - decode_left_ctx)
+                : 0;
+            const int32_t slice_frames = end - slice_start;
+            std::vector<float> chunk_samples;
+            if (!self.audio_decoder_.decode(
+                    decoder_code_data + (size_t) slice_start * (size_t) n_codebooks,
+                    slice_frames, chunk_samples)) {
+                decode_ok = false;
+                break;
+            }
+            add_decoder_timing(self.audio_decoder_.get_last_timing());
+            const int32_t ctx_frames = start - slice_start;
+            if (ctx_frames > 0) {
+                const size_t drop = (size_t) ctx_frames * (size_t) qwen3_tts_codec_hop_length;
+                if (drop > chunk_samples.size()) {
+                    result.error_msg = "Chunked decode context trim is out of range";
+                    decode_ok = false;
+                    break;
+                }
+                chunk_samples.erase(chunk_samples.begin(), chunk_samples.begin() + (ptrdiff_t) drop);
+            }
+            result.audio.insert(result.audio.end(), chunk_samples.begin(), chunk_samples.end());
+        }
+    }
+    if (!decode_ok) {
+        if (result.error_msg.empty()) {
+            result.error_msg = "Failed to decode speech codes: " + self.audio_decoder_.get_error();
+        }
         return result;
     }
-    const audio_decoder_timing & decoder_timing = self.audio_decoder_.get_last_timing();
     result.t_decode_graph_build_ms = decoder_timing.graph_build_ms;
     result.t_decode_graph_alloc_ms = decoder_timing.graph_alloc_ms;
     result.t_decode_input_upload_ms = decoder_timing.input_upload_ms;

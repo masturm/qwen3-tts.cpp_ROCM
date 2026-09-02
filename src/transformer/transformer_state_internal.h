@@ -163,7 +163,10 @@ struct tts_transformer_state {
     bool code_pred_sched_reserve_failed = false;
     bool talker_replay_ready = false;
     bool talker_replay_failed = false;
+    bool talker_replay_disabled_logged = false;
     int32_t talker_replay_n_kv_pad = 0;
+    int32_t talker_replay_last_bucket = 0;
+    size_t talker_replay_last_buffer_bytes = 0;
     struct ggml_cgraph * talker_replay_graph = nullptr;
     bool code_pred_replay_ready = false;
     bool code_pred_replay_failed = false;

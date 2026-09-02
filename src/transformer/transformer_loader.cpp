@@ -75,7 +75,10 @@ void TTSTransformer::unload_model() {
     impl_->state.talker_replay_graph = nullptr;
     impl_->state.talker_replay_ready = false;
     impl_->state.talker_replay_failed = false;
+    impl_->state.talker_replay_disabled_logged = false;
     impl_->state.talker_replay_n_kv_pad = 0;
+    impl_->state.talker_replay_last_bucket = 0;
+    impl_->state.talker_replay_last_buffer_bytes = 0;
     for (ggml_backend_sched_t replay_sched : impl_->state.code_pred_replay_scheds) {
         if (replay_sched) {
             ggml_backend_sched_free(replay_sched);

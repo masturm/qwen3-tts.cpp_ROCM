@@ -17,8 +17,27 @@ bool talker_replay_enabled() {
     return !value || value[0] != '0';
 }
 
+int32_t talker_replay_max_bucket() {
+    const char * value = std::getenv("QWEN3_TTS_TALKER_REPLAY_MAX_BUCKET");
+    if (!value || value[0] == '\0' || value[0] == '0') {
+        return 2048;  // bounds the replay compute buffer to a few GiB
+    }
+    const int parsed = std::atoi(value);
+    return parsed > 0 ? parsed : 2048;
+}
+
 int32_t talker_step_n_kv_pad(const tts_transformer_state & state, int32_t n_past) {
     return std::min<int32_t>(state.cache.n_ctx, GGML_PAD(n_past + 1, 256));
+}
+
+// Permanently disable the replay optimization for this process and log once.
+void disable_talker_replay(tts_transformer_state & state, const char * reason) {
+    state.talker_replay_failed = true;
+    state.talker_replay_ready = false;
+    if (!state.talker_replay_disabled_logged) {
+        state.talker_replay_disabled_logged = true;
+        fprintf(stderr, "  Talker replay graph disabled (%s); using dynamic graphs\n", reason);
+    }
 }
 
 bool ensure_talker_replay_graph(TTSTransformer & self, tts_transformer_private & impl,
@@ -38,6 +57,38 @@ bool ensure_talker_replay_graph(TTSTransformer & self, tts_transformer_private &
     const int32_t n_kv_pad = talker_step_n_kv_pad(state, n_past);
     if (state.talker_replay_ready && state.talker_replay_n_kv_pad == n_kv_pad) {
         return true;
+    }
+
+    // Bucket cap: the replay compute buffer grows ~linearly with the bucket
+    // size (~5.5 GiB at 2048 tokens for the 1.7B model), so bound it.
+    if (n_kv_pad > talker_replay_max_bucket()) {
+        disable_talker_replay(state, "bucket exceeds QWEN3_TTS_TALKER_REPLAY_MAX_BUCKET");
+        return false;
+    }
+
+    // VRAM headroom guard: a failed reservation on a shared GPU used to abort
+    // the process inside ggml; even with graceful failure, skip the attempt
+    // when the estimated buffer does not fit in the currently free VRAM.
+    if (!state.talker_replay_ready) {
+        size_t free_bytes = 0, total_bytes = 0;
+        ggml_backend_dev_t dev = ggml_backend_get_device(state.backend);
+        if (dev) {
+            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+        }
+        size_t est_bytes = (size_t) (512 * 1024 * 1024);  // first-bucket guess
+        if (state.talker_replay_last_buffer_bytes > 0 && state.talker_replay_last_bucket > 0) {
+            // Step-graph buffers scale ~linearly with the context length.
+            est_bytes = state.talker_replay_last_buffer_bytes
+                * (size_t) n_kv_pad / (size_t) std::max<int32_t>(1, state.talker_replay_last_bucket);
+        }
+        est_bytes = est_bytes * 5 / 4 + (size_t) (256 * 1024 * 1024);  // safety margin
+        if (total_bytes > 0 && free_bytes < est_bytes) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "insufficient VRAM: free %.1f GiB < est. %.1f GiB for %d-token bucket",
+                     free_bytes / 1073741824.0, est_bytes / 1073741824.0, n_kv_pad);
+            disable_talker_replay(state, msg);
+            return false;
+        }
     }
 
     if (state.talker_replay_sched) {
@@ -64,12 +115,31 @@ bool ensure_talker_replay_graph(TTSTransformer & self, tts_transformer_private &
         return false;
     }
 
+    size_t free_before = 0, total_before = 0;
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(state.backend);
+        if (dev) {
+            ggml_backend_dev_memory(dev, &free_before, &total_before);
+        }
+    }
     if (!ggml_backend_sched_alloc_graph(state.talker_replay_sched, state.talker_replay_graph)) {
         ggml_backend_sched_reset(state.talker_replay_sched);
         state.talker_replay_ready = false;
-        state.talker_replay_failed = true;
-        fprintf(stderr, "  Talker replay graph allocation failed; using dynamic graphs\n");
+        disable_talker_replay(state, "graph allocation failed");
         return false;
+    }
+
+    // Self-calibrate the buffer-size estimate from the observed VRAM delta.
+    size_t free_after = 0, total_after = 0;
+    {
+        ggml_backend_dev_t dev = ggml_backend_get_device(state.backend);
+        if (dev) {
+            ggml_backend_dev_memory(dev, &free_after, &total_after);
+        }
+    }
+    if (total_before > 0 && free_before >= free_after) {
+        state.talker_replay_last_buffer_bytes = free_before - free_after;
+        state.talker_replay_last_bucket = n_kv_pad;
     }
 
     state.talker_replay_ready = true;

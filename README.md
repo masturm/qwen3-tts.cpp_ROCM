@@ -223,6 +223,7 @@ cmake -S . -B build-hip \
   -DCMAKE_BUILD_TYPE=Release \
   -DQWEN3_TTS_HIP=ON \
   -DGGML_HIP_GRAPHS=ON \
+  -DAMDGPU_TARGETS=gfxXXX \
   -DGGML_HIP=ON
 cmake --build build-hip -j
 ```
