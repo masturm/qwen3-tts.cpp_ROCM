@@ -4,12 +4,14 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <random>
 #include <string>
@@ -31,6 +33,7 @@ struct server_options {
     std::string host     = "127.0.0.1";
     int         port     = 8080;
     int         threads  = 4;
+    std::string voice_embeddings_dir;  // optional directory with <name>.json embedding files
 };
 
 void print_usage(const char * program) {
@@ -38,12 +41,13 @@ void print_usage(const char * program) {
             "Usage: %s -m <model_dir> [options]\n"
             "\n"
             "Options:\n"
-            "  -m, --model <dir>        Model directory (required)\n"
-            "      --model-name <name>  Optional base name for model files\n"
-            "      --host <addr>        Bind address (default: 127.0.0.1)\n"
-            "      --port <n>           Port (default: 8080)\n"
-            "  -j, --threads <n>        Default synthesis threads (default: 4)\n"
-            "  -h, --help               Show this help\n",
+            "  -m, --model <dir>                Model directory (required)\n"
+            "      --model-name <name>          Optional base name for model files\n"
+            "      --voice-embeddings-dir <dir> Directory with <name>.json voice embeddings\n"
+            "      --host <addr>                Bind address (default: 127.0.0.1)\n"
+            "      --port <n>                   Port (default: 8080)\n"
+            "  -j, --threads <n>                Default synthesis threads (default: 4)\n"
+            "  -h, --help                       Show this help\n",
             program);
 }
 
@@ -64,6 +68,8 @@ bool parse_args(int argc, char ** argv, server_options & opt) {
             opt.model_dir = need("--model");
         } else if (a == "--model-name") {
             opt.model_name = need("--model-name");
+        } else if (a == "--voice-embeddings-dir") {
+            opt.voice_embeddings_dir = need("--voice-embeddings-dir");
         } else if (a == "--host") {
             opt.host = need("--host");
         } else if (a == "--port") {
@@ -137,6 +143,79 @@ bool apply_params_from_json(const json & j, qwen3_tts::tts_params & p,
     return true;
 }
 
+// Load a speaker embedding from a JSON file that may be:
+//   - A plain array: [0.1, 0.2, ...]
+//   - An object with "embedding" field: {"dim":2048,"embedding":[...]}
+//   - An object with "embedding" as a top-level key from /v1/speaker_embedding response
+static bool load_embedding_from_json_file(const std::string & path, std::vector<float> & emb) {
+    std::ifstream in(path);
+    if (!in) return false;
+
+    json j;
+    try {
+        j = json::parse(in);
+    } catch (const std::exception & e) {
+        fprintf(stderr, "Warning: JSON parse error in %s: %s\n", path.c_str(), e.what());
+        return false;
+    }
+
+    // Plain array: [0.1, 0.2, ...]
+    if (j.is_array()) {
+        emb.reserve(j.size());
+        for (const auto & v : j) {
+            emb.push_back(v.get<float>());
+        }
+        return !emb.empty();
+    }
+
+    // Object with "embedding" field: {"dim":2048,"embedding":[...]}
+    if (j.is_object() && j.contains("embedding") && j["embedding"].is_array()) {
+        emb.reserve(j["embedding"].size());
+        for (const auto & v : j["embedding"]) {
+            emb.push_back(v.get<float>());
+        }
+        return !emb.empty();
+    }
+
+    fprintf(stderr, "Warning: unrecognized embedding format in %s\n", path.c_str());
+    return false;
+}
+
+// Load voice embeddings from a directory of JSON files.
+// Each file <name>.json is loaded as a speaker embedding.
+// Returns a map from lowercase name → embedding vector.
+std::map<std::string, std::vector<float>> load_voice_embeddings(const std::string & dir) {
+    std::map<std::string, std::vector<float>> embeddings;
+    if (dir.empty()) return embeddings;
+
+    fs::path d(dir);
+    if (!fs::is_directory(d)) {
+        fprintf(stderr, "Warning: voice embeddings directory does not exist: %s\n", dir.c_str());
+        return embeddings;
+    }
+
+    for (const auto & entry : fs::directory_iterator(d)) {
+        if (!entry.is_regular_file()) continue;
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext != ".json") continue;
+
+        std::string name = entry.path().stem().string();
+        std::string name_lower = name;
+        std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
+
+        std::vector<float> emb;
+        if (load_embedding_from_json_file(entry.path().string(), emb)) {
+            size_t dim = emb.size();
+            embeddings[name_lower] = std::move(emb);
+            fprintf(stderr, "Loaded voice embedding: %s (%zu dims)\n", name_lower.c_str(), dim);
+        } else {
+            fprintf(stderr, "Warning: failed to load voice embedding: %s\n", entry.path().string().c_str());
+        }
+    }
+    return embeddings;
+}
+
 std::string random_suffix() {
     static std::mt19937_64 rng{std::random_device{}()};
     uint64_t v = rng();
@@ -187,6 +266,7 @@ struct synth_context {
     qwen3_tts::Qwen3TTS & tts;
     std::mutex &          mu;
     int                   default_threads;
+    std::map<std::string, std::vector<float>> voice_embeddings; // name → embedding
 };
 
 void handle_synthesize(synth_context & ctx, const httplib::Request & req, httplib::Response & res) {
@@ -354,8 +434,13 @@ void handle_capabilities(qwen3_tts::Qwen3TTS & tts, httplib::Response & res) {
     send_json(res, 200, out);
 }
 
-void handle_speakers(qwen3_tts::Qwen3TTS & tts, httplib::Response & res) {
-    send_json(res, 200, json{{"speakers", tts.get_available_speakers()}});
+void handle_speakers(synth_context & ctx, httplib::Response & res) {
+    json speakers = ctx.tts.get_available_speakers();
+    // Also include voice embedding names
+    for (const auto & [name, _] : ctx.voice_embeddings) {
+        speakers.push_back(name);
+    }
+    send_json(res, 200, json{{"speakers", speakers}});
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +448,8 @@ void handle_speakers(qwen3_tts::Qwen3TTS & tts, httplib::Response & res) {
 // ---------------------------------------------------------------------------
 
 // Map OpenAI voice names → language codes the upstream understands.
-static std::string openai_voice_to_language(const std::string & voice) {
+// (Kept for reference; language resolution is now handled by resolve_language_from_body.)
+[[maybe_unused]] static std::string openai_voice_to_language(const std::string & voice) {
     std::string lower = voice;
     std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
@@ -448,6 +534,40 @@ void handle_openai_models(httplib::Response & res) {
     send_json(res, 200, out);
 }
 
+// Case-insensitive check if voice matches a known speaker name.
+// Returns the canonical speaker name on match, or empty string.
+static std::string find_speaker_by_voice(const std::vector<std::string> & speakers,
+                                          const std::string & voice) {
+    std::string lower = voice;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    for (const auto & s : speakers) {
+        std::string sl = s;
+        std::transform(sl.begin(), sl.end(), sl.begin(), ::tolower);
+        if (sl == lower) return s;
+    }
+    return {};
+}
+
+// Resolve language from body field or default to "en".
+// Returns true on success, sets lang_id.
+static bool resolve_language_from_body(const json & body, int & lang_id) {
+    if (body.contains("language")) {
+        const auto & lf = body["language"];
+        if (lf.is_number_integer()) {
+            lang_id = lf.get<int32_t>();
+            return true;
+        } else if (lf.is_string()) {
+            bool ok;
+            lang_id = resolve_language_id(lf.get<std::string>(), ok);
+            return ok;
+        }
+    }
+    // Default language
+    bool ok;
+    lang_id = resolve_language_id("en", ok);
+    return ok;
+}
+
 void handle_openai_speech(synth_context & ctx, const httplib::Request & req, httplib::Response & res) {
     json body;
     try {
@@ -464,15 +584,10 @@ void handle_openai_speech(synth_context & ctx, const httplib::Request & req, htt
     }
     std::string text = body["input"].get<std::string>();
 
-    // Voice → language mapping
+    // Voice → voice embedding / speaker / language
     std::string voice = body.value("voice", "alloy");
-    std::string lang_str = openai_voice_to_language(voice);
-    bool ok;
-    int lang_id = resolve_language_id(lang_str, ok);
-    if (!ok) {
-        send_error(res, 400, std::string("unknown voice/language: ") + voice);
-        return;
-    }
+    std::string voice_lower = voice;
+    std::transform(voice_lower.begin(), voice_lower.end(), voice_lower.begin(), ::tolower);
 
     // Speed warning (logged, not supported)
     float speed = body.value("speed", 1.0f);
@@ -483,10 +598,57 @@ void handle_openai_speech(synth_context & ctx, const httplib::Request & req, htt
     // Response format
     std::string response_format = body.value("response_format", "mp3");
 
-    // Build params
+    // Resolve language (default "en" if not specified)
+    int lang_id;
+    if (!resolve_language_from_body(body, lang_id)) {
+        send_error(res, 400, "unknown language");
+        return;
+    }
+
     qwen3_tts::tts_params params;
     std::string err;
     json params_json = json::object({{"language", lang_id}});
+
+    // 1. Check voice embeddings directory first
+    auto emb_it = ctx.voice_embeddings.find(voice_lower);
+    if (emb_it != ctx.voice_embeddings.end()) {
+        // Voice matches a loaded embedding file
+        qwen3_tts::tts_result r;
+        {
+            std::lock_guard<std::mutex> lock(ctx.mu);
+            r = ctx.tts.synthesize_with_speaker_embedding(text, emb_it->second, params);
+        }
+        if (!r.success) {
+            send_error(res, 500, r.error_msg);
+            return;
+        }
+        send_openai_audio(res, r.audio, r.sample_rate, r, response_format);
+        return;
+    }
+
+    // Voice not found in embeddings — warn if we have any loaded
+    if (!ctx.voice_embeddings.empty()) {
+        fprintf(stderr, "Warning: voice '%s' not found in voice embeddings. Available: ", voice_lower.c_str());
+        bool first = true;
+        for (const auto & [name, _] : ctx.voice_embeddings) {
+            if (!first) fprintf(stderr, ", ");
+            fprintf(stderr, "%s", name.c_str());
+            first = false;
+        }
+        fprintf(stderr, "\n");
+    }
+
+    // 2. Check named speakers (CustomVoice models)
+    auto caps = ctx.tts.get_model_capabilities();
+    std::string speaker;
+    if (caps.supports_named_speakers) {
+        auto speakers = ctx.tts.get_available_speakers();
+        speaker = find_speaker_by_voice(speakers, voice);
+    }
+    if (!speaker.empty()) {
+        params_json["speaker"] = speaker;
+    }
+
     if (!apply_params_from_json(params_json, params, ctx.default_threads, err)) {
         send_error(res, 400, err);
         return;
@@ -526,8 +688,11 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "Models loaded in %lld ms\n",
             (long long) std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
 
+    // Load voice embeddings from directory
+    auto voice_embeddings = load_voice_embeddings(opt.voice_embeddings_dir);
+
     std::mutex synth_mu;
-    synth_context ctx{tts, synth_mu, opt.threads};
+    synth_context ctx{tts, synth_mu, opt.threads, std::move(voice_embeddings)};
 
     httplib::Server svr;
     svr.set_payload_max_length(256 * 1024 * 1024); // 256 MiB uploads cap
@@ -550,7 +715,7 @@ int main(int argc, char ** argv) {
         handle_capabilities(tts, res);
     });
     svr.Get("/v1/speakers", [&](const httplib::Request &, httplib::Response & res) {
-        handle_speakers(tts, res);
+        handle_speakers(ctx, res);
     });
     svr.Post("/v1/synthesize", [&](const httplib::Request & req, httplib::Response & res) {
         handle_synthesize(ctx, req, res);
